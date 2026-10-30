@@ -1,0 +1,444 @@
+import os
+import subprocess
+import sys
+
+for _pkg, _module in [("requests", "requests"), ("pyTelegramBotAPI", "telebot")]:
+    try:
+        __import__(_module)
+    except ImportError:
+        try:
+            subprocess.check_call(
+                [sys.executable, "-m", "pip", "install", "--quiet", _pkg]
+            )
+        except (subprocess.CalledProcessError, OSError) as exc:
+            sys.exit(f"Failed to install {_pkg}: {exc}")
+
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import quote
+
+import requests
+import telebot
+from telebot import types
+from telebot.apihelper import ApiTelegramException
+
+TELEGRAM_BOT_TOKEN = "8840120811:AAH9ukhxXQoWe2fWffSYcdV7W6jm7DUV3AU"
+GEMINI_API_KEY = "AQ.Ab8RN6LSlp5Wg_9npIyBLUqd-Dndh9p_XH-QdrRxcNYMC_6mqw"
+DEFAULT_MODEL = "gemini-2.0-flash"
+
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "").strip() or DEFAULT_MODEL
+ALLOWED_USERS = set()
+
+GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models"
+HOST = "0.0.0.0"
+PORT = 8080
+MODEL_CHOICES = tuple(
+    dict.fromkeys(
+        (
+            GEMINI_MODEL,
+            "gemini-2.0-flash",
+            "gemini-1.5-flash",
+            "gemini-1.5-pro",
+        )
+    )
+)
+TELEGRAM_MESSAGE_LIMIT = 4000
+SESSION_TTL_SECONDS = 6 * 60 * 60
+MAX_HISTORY_MESSAGES = 20
+MAX_OUTPUT_TOKENS = 8192
+RETRY_STATUSES = {500, 502, 503, 504}
+BLOCKED_FINISH_REASONS = {
+    "SAFETY",
+    "PROHIBITED_CONTENT",
+    "BLOCKLIST",
+    "SPII",
+    "RECITATION",
+}
+
+if not TELEGRAM_BOT_TOKEN or "ضع_توكن" in TELEGRAM_BOT_TOKEN:
+    sys.exit("Missing TELEGRAM_BOT_TOKEN.")
+if not GEMINI_API_KEY or "ضع_مفتاح" in GEMINI_API_KEY:
+    sys.exit("Missing GEMINI_API_KEY.")
+
+bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN, parse_mode=None, threaded=True, num_threads=8)
+
+HELP_TEXT = (
+    "مرحباً! أرسل سؤالك وسأجيبك.\n\n"
+    "الأوامر:\n"
+    "/new — بدء محادثة جديدة\n"
+    "/model — اختيار النموذج\n"
+    "/help — عرض المساعدة"
+)
+
+_sessions = {}
+_sessions_lock = threading.Lock()
+
+
+class HealthHandler(BaseHTTPRequestHandler):
+    server_version = "BotHealth"
+    sys_version = ""
+
+    def _respond(self, send_body):
+        if self.path.split("?", 1)[0] not in ("/", "/healthz"):
+            self.send_response(404)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+
+        body = b"ok\n"
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        if send_body:
+            self.wfile.write(body)
+
+    def do_GET(self):
+        self._respond(send_body=True)
+
+    def do_HEAD(self):
+        self._respond(send_body=False)
+
+    def log_message(self, format, *args):
+        return
+
+
+def start_health_server():
+    try:
+        server = ThreadingHTTPServer((HOST, PORT), HealthHandler)
+    except OSError as exc:
+        print(f"Health endpoint disabled: could not bind {HOST}:{PORT} ({exc}).")
+        return None
+
+    server.daemon_threads = True
+    threading.Thread(
+        target=server.serve_forever,
+        name="health-http",
+        daemon=True,
+    ).start()
+    print(f"Health endpoint listening on {HOST}:{PORT}")
+    return server
+
+
+def is_allowed(user_id):
+    return True
+
+
+def get_session(chat_id):
+    now = time.time()
+    with _sessions_lock:
+        expired = [
+            key
+            for key, session in _sessions.items()
+            if now - session["seen"] > SESSION_TTL_SECONDS
+            and not session["lock"].locked()
+        ]
+        for key in expired:
+            del _sessions[key]
+
+        session = _sessions.get(chat_id)
+        if session is None:
+            session = {
+                "history": [],
+                "model": GEMINI_MODEL,
+                "lock": threading.Lock(),
+                "seen": now,
+            }
+            _sessions[chat_id] = session
+        session["seen"] = now
+        return session
+
+
+def split_text(text, limit=TELEGRAM_MESSAGE_LIMIT):
+    remaining = text.strip()
+    chunks = []
+    while len(remaining) > limit:
+        cut = remaining.rfind("\n", 0, limit)
+        if cut < limit // 2:
+            cut = remaining.rfind(" ", 0, limit)
+        if cut < limit // 2:
+            cut = limit
+        chunks.append(remaining[:cut])
+        remaining = remaining[cut:].lstrip()
+    if remaining:
+        chunks.append(remaining)
+    return chunks or ["…"]
+
+
+def _api_error_text(response):
+    try:
+        data = response.json()
+        return str(data.get("error", {}).get("message", ""))[:300]
+    except (ValueError, AttributeError):
+        return ""
+
+
+def _post_gemini(contents, model):
+    url = f"{GEMINI_API_URL}/{quote(model, safe='-._')}:generateContent"
+    response = None
+    for attempt in range(2):
+        try:
+            response = requests.post(
+                url,
+                headers={
+                    "x-goog-api-key": GEMINI_API_KEY,
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "contents": contents,
+                    "generationConfig": {"maxOutputTokens": MAX_OUTPUT_TOKENS},
+                },
+                timeout=120,
+            )
+        except requests.RequestException as exc:
+            print(f"Gemini connection failed: {type(exc).__name__}")
+            return None, "تعذر الاتصال بخدمة الإجابة. حاول مرة أخرى بعد قليل."
+
+        if response.status_code not in RETRY_STATUSES or attempt == 1:
+            break
+        time.sleep(1)
+    return response, None
+
+
+def call_gemini(history, user_text, model):
+    contents = [
+        {
+            "role": "model" if message["role"] == "assistant" else "user",
+            "parts": [{"text": message["content"]}],
+        }
+        for message in history
+    ]
+    contents.append({"role": "user", "parts": [{"text": user_text}]})
+
+    candidates_to_try = [model] + [m for m in MODEL_CHOICES if m != model]
+    response = None
+    used_model = model
+    for candidate in candidates_to_try:
+        response, error = _post_gemini(contents, candidate)
+        if error:
+            return None, None, None, error
+        if response.status_code != 404:
+            used_model = candidate
+            break
+        print(f"Gemini model not available: {candidate}")
+    else:
+        return None, None, None, "النموذج المحدد غير متاح حالياً. جرّب /model لاختيار نموذج آخر."
+
+    if not response.ok:
+        code = response.status_code
+        print(f"Gemini API returned HTTP {code}: {_api_error_text(response)}")
+        if code == 429:
+            return None, None, None, "تم تجاوز حد الاستخدام المسموح. حاول بعد قليل."
+        if code in (400, 401, 403):
+            return None, None, None, f"تعذر إكمال الطلب (HTTP {code}). تحقق من GEMINI_API_KEY وصلاحياته."
+        return None, None, None, f"تعذر إكمال الطلب (HTTP {code}). حاول مرة أخرى."
+
+    try:
+        payload = response.json()
+    except ValueError:
+        payload = None
+    if not isinstance(payload, dict):
+        print("Gemini API returned an invalid JSON response.")
+        return None, None, None, "وصل رد غير صالح من الخدمة. حاول مرة أخرى."
+
+    candidates = payload.get("candidates") or []
+    candidate = candidates[0] if candidates else {}
+    answer_parts = []
+    for part in (candidate.get("content") or {}).get("parts") or []:
+        text = part.get("text")
+        if isinstance(text, str) and text and not part.get("thought", False):
+            answer_parts.append(text)
+    answer_text = "".join(answer_parts)
+
+    if not answer_text:
+        block_reason = (payload.get("promptFeedback") or {}).get("blockReason")
+        finish_reason = candidate.get("finishReason")
+        print(
+            "Gemini API response did not contain text "
+            f"(blockReason={block_reason}, finishReason={finish_reason})."
+        )
+        if block_reason or finish_reason in BLOCKED_FINISH_REASONS:
+            return None, None, None, "تعذر الرد على هذا الطلب بسبب فلاتر الأمان."
+        return None, None, None, "لم يصل رد نصي. حاول مرة أخرى."
+
+    updated_history = history + [
+        {"role": "user", "content": user_text},
+        {"role": "assistant", "content": answer_text},
+    ]
+    updated_history = updated_history[-MAX_HISTORY_MESSAGES:]
+    return answer_text, updated_history, used_model, None
+
+
+def model_keyboard(current):
+    keyboard = types.InlineKeyboardMarkup(row_width=1)
+    buttons = [
+        types.InlineKeyboardButton(
+            ("✅ " if model == current else "") + model,
+            callback_data=f"model:{model}",
+        )
+        for model in MODEL_CHOICES
+    ]
+    keyboard.add(*buttons)
+    return keyboard
+
+
+@bot.message_handler(commands=["start", "help"])
+def command_start(message):
+    bot.reply_to(message, HELP_TEXT)
+
+
+@bot.message_handler(commands=["new"])
+def command_new(message):
+    session = get_session(message.chat.id)
+    if not session["lock"].acquire(blocking=False):
+        bot.reply_to(message, "⏳ انتظر حتى ينتهي الرد الحالي ثم أعد المحاولة.")
+        return
+    try:
+        session["history"] = []
+        bot.reply_to(message, "✦ بدأت محادثة جديدة.")
+    finally:
+        session["lock"].release()
+
+
+@bot.message_handler(commands=["model", "models"])
+def command_model(message):
+    session = get_session(message.chat.id)
+    bot.reply_to(
+        message,
+        "اختر النموذج:",
+        reply_markup=model_keyboard(session["model"]),
+    )
+
+
+@bot.callback_query_handler(func=lambda call: (call.data or "").startswith("model:"))
+def callback_model(call):
+    model = call.data.split(":", 1)[1]
+    if model not in MODEL_CHOICES:
+        bot.answer_callback_query(call.id, "نموذج غير معروف.")
+        return
+
+    session = get_session(call.message.chat.id)
+    session["model"] = model
+    bot.answer_callback_query(call.id, f"النموذج الآن: {model}")
+    try:
+        bot.edit_message_reply_markup(
+            call.message.chat.id,
+            call.message.message_id,
+            reply_markup=model_keyboard(model),
+        )
+    except ApiTelegramException:
+        pass
+
+
+@bot.message_handler(
+    content_types=["text"],
+    func=lambda message: bool(message.text) and not message.text.startswith("/"),
+)
+def on_text(message):
+    session = get_session(message.chat.id)
+    if not session["lock"].acquire(blocking=False):
+        bot.reply_to(message, "⏳ انتظر حتى ينتهي الرد السابق.")
+        return
+
+    try:
+        try:
+            bot.send_chat_action(message.chat.id, "typing")
+        except ApiTelegramException:
+            pass
+        placeholder = bot.reply_to(message, "⏳ جاري التفكير…")
+        answer, history, used_model, error = call_gemini(
+            session["history"],
+            message.text,
+            session["model"],
+        )
+        if error:
+            bot.edit_message_text(error, message.chat.id, placeholder.message_id)
+            return
+
+        session["history"] = history
+        session["model"] = used_model
+        chunks = split_text(answer)
+        try:
+            bot.edit_message_text(chunks[0], message.chat.id, placeholder.message_id)
+        except ApiTelegramException:
+            bot.send_message(message.chat.id, chunks[0])
+        for chunk in chunks[1:]:
+            bot.send_message(message.chat.id, chunk)
+    except Exception as exc:
+        print(f"Message handling failed: {type(exc).__name__}: {exc}")
+        try:
+            bot.send_message(message.chat.id, "حدث خطأ غير متوقع. حاول مرة أخرى.")
+        except Exception:
+            pass
+    finally:
+        session["lock"].release()
+
+
+@bot.message_handler(
+    content_types=["photo", "voice", "audio", "video", "document", "sticker"]
+)
+def on_unsupported_content(message):
+    bot.reply_to(message, "أرسل رسالة نصية من فضلك.")
+
+
+def connect_to_telegram(max_attempts=5):
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return bot.get_me()
+        except ApiTelegramException as exc:
+            code = getattr(exc, "error_code", 0)
+            if code == 401:
+                sys.exit("Telegram rejected TELEGRAM_BOT_TOKEN.")
+            print(f"Telegram error (HTTP {code}); attempt {attempt}/{max_attempts}.")
+        except requests.RequestException as exc:
+            print(f"Telegram connection failed: {type(exc).__name__}; attempt {attempt}/{max_attempts}.")
+        time.sleep(5)
+    sys.exit("Could not connect to Telegram.")
+
+
+def main():
+    start_health_server()
+    me = connect_to_telegram()
+
+    try:
+        bot.remove_webhook()
+        bot.set_my_commands(
+            [
+                types.BotCommand("new", "محادثة جديدة"),
+                types.BotCommand("model", "اختيار النموذج"),
+                types.BotCommand("help", "المساعدة"),
+            ]
+        )
+    except Exception as exc:
+        print(f"Could not update Telegram bot settings: {type(exc).__name__}.")
+
+    print(f"Telegram bot is running: @{me.username}")
+    first_run = True
+    while True:
+        skip_pending = first_run
+        first_run = False
+        try:
+            bot.polling(
+                non_stop=False,
+                skip_pending=skip_pending,
+                timeout=30,
+                long_polling_timeout=30,
+            )
+        except KeyboardInterrupt:
+            print("Bot stopped.")
+            return
+        except ApiTelegramException as exc:
+            if getattr(exc, "error_code", 0) == 409:
+                print("Telegram polling conflict (HTTP 409); standby mode.")
+                while True:
+                    time.sleep(60)
+            print(f"Telegram polling failed (HTTP {getattr(exc, 'error_code', 0)}); retrying in 5 seconds.")
+            time.sleep(5)
+        except Exception as exc:
+            print(f"Polling failed: {type(exc).__name__}; retrying in 5 seconds.")
+            time.sleep(5)
+
+
+if __name__ == "__main__":
+    main()
